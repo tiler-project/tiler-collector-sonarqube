@@ -1,6 +1,5 @@
 package io.tiler.collectors.sonarqube;
 
-import org.joda.time.DateTime;
 import org.joda.time.format.DateTimeFormatter;
 import org.joda.time.format.ISODateTimeFormat;
 import org.vertx.java.core.Handler;
@@ -142,6 +141,7 @@ public class SonarQubeCollectorVerticle extends Verticle {
   private void transformMetrics(JsonArray projects, Handler<JsonArray> handler) {
     logger.info("Transforming metrics");
     HashMap<String, JsonObject> newMetricMap = new HashMap<>();
+    long metricTimestamp = getCurrentTimestampInMicroseconds();
 
     for (int projectIndex = 0, projectCount = projects.size(); projectIndex < projectCount; projectIndex++) {
       JsonObject project = projects.get(projectIndex);
@@ -154,7 +154,7 @@ public class SonarQubeCollectorVerticle extends Verticle {
 
       for (int cellIndex = 0, cellCount = cells.size(); cellIndex < cellCount; cellIndex ++) {
         JsonObject cell = cells.get(cellIndex);
-        long time = getMillisTimestampFromISODateTime(cell.getString("d"));
+        long pointTime = getTimestampInMicrosecondsFromISODateTime(cell.getString("d"));
         JsonArray values = cell.getArray("v");
 
         for (int columnIndex = 0, columnCount = columns.size(); columnIndex < columnCount; columnIndex++) {
@@ -167,13 +167,13 @@ public class SonarQubeCollectorVerticle extends Verticle {
             newMetric = new JsonObject()
               .putString("name", newMetricName)
               .putArray("points", new JsonArray())
-              .putNumber("timestamp", getCurrentMillisTimestamp());
+              .putNumber("timestamp", metricTimestamp);
             newMetricMap.put(newMetricName, newMetric);
           }
 
           JsonArray newPoints = newMetric.getArray("points");
           newPoints.addObject(new JsonObject()
-            .putNumber("time", time)
+            .putNumber("time", pointTime)
             .putString("projectKey", projectKey)
             .putString("projectName", projectName)
             .putNumber("value", values.get(columnIndex)));
@@ -190,12 +190,12 @@ public class SonarQubeCollectorVerticle extends Verticle {
     handler.handle(newMetrics);
   }
 
-  private long getMillisTimestampFromISODateTime(String isoDateTime) {
-    return dateTimeFormatter.parseDateTime(isoDateTime).getMillis();
+  private long getTimestampInMicrosecondsFromISODateTime(String isoDateTime) {
+    return dateTimeFormatter.parseDateTime(isoDateTime).getMillis() * 1000;
   }
 
-  private long getCurrentMillisTimestamp() {
-    return DateTime.now().getMillis();
+  private long getCurrentTimestampInMicroseconds() {
+    return System.currentTimeMillis() * 1000;
   }
 
   private void publishNewMetrics(JsonArray metrics, Handler<Void> handler) {

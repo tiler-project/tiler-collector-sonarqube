@@ -1,5 +1,5 @@
 {
-  "main":"io.tiler.collectors.sonarqube.PingVerticle",
+  "main":"io.tiler.collectors.sonarqube.SonarQubeCollectorVerticle",
 
   "description":"SonarQube collector for the Tiler dashboard framework",
   "licenses": ["MIT"],

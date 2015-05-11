@@ -1,5 +1,8 @@
 package io.tiler.collectors.sonarqube;
 
+import io.tiler.collectors.sonarqube.config.Config;
+import io.tiler.collectors.sonarqube.config.ConfigFactory;
+import io.tiler.collectors.sonarqube.config.Server;
 import org.joda.time.format.DateTimeFormatter;
 import org.joda.time.format.ISODateTimeFormat;
 import org.vertx.java.core.Handler;
@@ -12,28 +15,21 @@ import org.vertx.java.platform.Verticle;
 
 import java.util.HashMap;
 import java.util.List;
+import java.util.stream.Collectors;
 
 public class SonarQubeCollectorVerticle extends Verticle {
   private Logger logger;
-  private JsonObject config;
+  private Config config;
   private EventBus eventBus;
   private DateTimeFormatter dateTimeFormatter;
-  private HttpClient httpClient;
+  private List<HttpClient> httpClients;
 
   public void start() {
     logger = container.logger();
-    config = container.config();
+    config = new ConfigFactory().load(container.config());
     eventBus = vertx.eventBus();
     dateTimeFormatter = ISODateTimeFormat.dateTimeParser();
-    httpClient = vertx.createHttpClient()
-      .setHost(getSonarQubeHost())
-      .setPort(getSonarQubePort())
-      .setSSL(getSonarQubeSsl())
-      .setTryUseCompression(true);
-    // Get the following error without turning keep alive off.  Looks like a vertx bug
-    // SEVERE: Exception in Java verticle
-    // java.nio.channels.ClosedChannelException
-    httpClient.setKeepAlive(false);
+    httpClients = createHttpClients();
 
     final boolean[] isRunning = {true};
 
@@ -57,27 +53,29 @@ public class SonarQubeCollectorVerticle extends Verticle {
     logger.info("SonarQubeCollectorVerticle started");
   }
 
-  private boolean getSonarQubeSsl() {
-    return config.getBoolean("ssl", false);
-  }
-
-  private Integer getSonarQubePort() {
-    return config.getInteger("port", 9000);
-  }
-
-  private String getSonarQubeHost() {
-    return config.getString("host", "localhost");
-  }
-
-  private Integer getProjectLimit() {
-    return config.getInteger("projectLimit", 10);
+  private List<HttpClient> createHttpClients() {
+    return config.servers()
+      .stream()
+      .map(server -> {
+        HttpClient httpClient = vertx.createHttpClient()
+          .setHost(server.host())
+          .setPort(server.port())
+          .setSSL(server.ssl())
+          .setTryUseCompression(true);
+        // Get the following error without turning keep alive off.  Looks like a vertx bug
+        // SEVERE: Exception in Java verticle
+        // java.nio.channels.ClosedChannelException
+        httpClient.setKeepAlive(false);
+        return httpClient;
+      })
+      .collect(Collectors.toList());
   }
 
   private void collect(Handler<Void> handler) {
     logger.info("Collection started");
-    getProjects(getProjectLimit(), projects -> {
-      getProjectMetrics(projects, 0, aVoid -> {
-        transformMetrics(projects, metrics -> {
+    getProjects(servers -> {
+      getProjectMetrics(servers, aVoid -> {
+        transformMetrics(servers, metrics -> {
           publishNewMetrics(metrics, aVoid3 -> {
             logger.info("Collection finished");
             handler.handle(null);
@@ -87,33 +85,53 @@ public class SonarQubeCollectorVerticle extends Verticle {
     });
   }
 
-  private void getProjects(int projectLimit, Handler<JsonArray> handler) {
-    httpClient.getNow("/api/projects/index?format=json", response -> {
+  private void getProjects(Handler<JsonArray> handler) {
+    getProjects(0, new JsonArray(), handler);
+  }
+
+  private void getProjects(int serverIndex, JsonArray servers, Handler<JsonArray> handler) {
+    if (serverIndex >= config.servers().size()) {
+      handler.handle(servers);
+      return;
+    }
+
+    Server serverConfig = config.servers().get(serverIndex);
+
+    httpClients.get(serverIndex).getNow(serverConfig.path() + "/api/projects/index?format=json", response -> {
       response.bodyHandler(body -> {
-        logger.info("Received project list " + body);
         JsonArray projects = new JsonArray(body.toString());
         logger.info("Received " + projects.size() + " projects");
+        int projectLimit = serverConfig.projectLimit();
         logger.info("Project limit set to " + projectLimit);
-
-        List projectList = projects.toList();
-        int projectCount = projectList.size();
-
-        while (projectCount > projectLimit) {
-          projectCount--;
-          projectList.remove(projectCount);
-        }
-
-        projects = new JsonArray(projectList);
+        projects = new JsonArray(projects.toList().subList(0, Math.min(projects.size(), projectLimit)));
         logger.info("There are " + projects.size() + " projects after limiting");
 
-        handler.handle(projects);
+        JsonObject server = new JsonObject()
+          .putString("name", serverConfig.name())
+          .putArray("projects", projects);
+
+        servers.addObject(server);
+        getProjects(serverIndex + 1, servers, handler);
       });
     });
   }
 
-  private void getProjectMetrics(JsonArray projects, int projectIndex, Handler<Void> handler) {
-    if (projectIndex >= projects.size()) {
+  private void getProjectMetrics(JsonArray servers, Handler<Void> handler) {
+    getProjectMetrics(0, 0, servers, handler);
+  }
+
+  private void getProjectMetrics(int serverIndex, int projectIndex, JsonArray servers, Handler<Void> handler) {
+    if (serverIndex >= servers.size()) {
       handler.handle(null);
+      return;
+    }
+
+    JsonObject server = servers.get(serverIndex);
+    Server serverConfig = config.servers().get(serverIndex);
+    JsonArray projects = server.getArray("projects");
+
+    if (projectIndex >= projects.size()) {
+      getProjectMetrics(serverIndex + 1, 0, servers, handler);
       return;
     }
 
@@ -121,71 +139,74 @@ public class SonarQubeCollectorVerticle extends Verticle {
     String projectKey = project.getString("k");
     logger.info("Getting metrics for " + projectKey + " project");
 
-    httpClient.getNow("/api/timemachine?resource=" + projectKey + "&metrics=coverage", response -> {
+    httpClients.get(serverIndex).getNow(serverConfig.path() + "/api/timemachine?resource=" + projectKey + "&metrics=coverage", response -> {
       response.bodyHandler(body -> {
-        logger.info("Received metrics for " + projectKey + " project " + body);
-        JsonArray timemachine = new JsonArray(body.toString());
+        logger.info("Received metrics for " + projectKey + " project");
+        JsonArray timeMachine = new JsonArray(body.toString());
 
-        if (timemachine.size() != 1) {
-          logger.warn("Unexpected length of " + timemachine.size() + "for timemachine response ");
+        if (timeMachine.size() != 1) {
+          logger.warn("Unexpected length of " + timeMachine.size() + "for time machine response ");
         } else {
-          JsonObject metrics = timemachine.get(0);
+          JsonObject metrics = timeMachine.get(0);
           project.putObject("metrics", metrics);
         }
 
-        getProjectMetrics(projects, projectIndex + 1, handler);
+        getProjectMetrics(serverIndex, projectIndex + 1, servers, handler);
       });
     });
   }
 
-  private void transformMetrics(JsonArray projects, Handler<JsonArray> handler) {
+  private void transformMetrics(JsonArray servers, Handler<JsonArray> handler) {
     logger.info("Transforming metrics");
     HashMap<String, JsonObject> newMetricMap = new HashMap<>();
     long metricTimestamp = getCurrentTimestampInMicroseconds();
 
-    for (int projectIndex = 0, projectCount = projects.size(); projectIndex < projectCount; projectIndex++) {
-      JsonObject project = projects.get(projectIndex);
-      String projectKey = project.getString("k");
-      String projectName = project.getString("nm");
-      JsonObject metrics = project.getObject("metrics");
+    servers.forEach(serverObject -> {
+      JsonObject server = (JsonObject) serverObject;
+      String serverName = server.getString("name");
 
-      JsonArray columns = metrics.getArray("cols");
-      JsonArray cells = metrics.getArray("cells");
+      server.getArray("projects").forEach(projectObject -> {
+        JsonObject project = (JsonObject) projectObject;
+        String projectKey = project.getString("k");
+        String projectName = project.getString("nm");
+        JsonObject metrics = project.getObject("metrics");
 
-      for (int cellIndex = 0, cellCount = cells.size(); cellIndex < cellCount; cellIndex ++) {
-        JsonObject cell = cells.get(cellIndex);
-        long pointTime = getTimestampInMicrosecondsFromISODateTime(cell.getString("d"));
-        JsonArray values = cell.getArray("v");
+        JsonArray columns = metrics.getArray("cols");
+        JsonArray cells = metrics.getArray("cells");
 
-        for (int columnIndex = 0, columnCount = columns.size(); columnIndex < columnCount; columnIndex++) {
-          JsonObject column = columns.get(columnIndex);
-          String newMetricName = "ci.sonarqube." + column.getString("metric");
+        cells.forEach(cellObject -> {
+          JsonObject cell = (JsonObject) cellObject;
+          long pointTime = getTimestampInMicrosecondsFromISODateTime(cell.getString("d"));
+          JsonArray values = cell.getArray("v");
 
-          JsonObject newMetric = newMetricMap.get(newMetricName);
+          for (int columnIndex = 0, columnCount = columns.size(); columnIndex < columnCount; columnIndex++) {
+            JsonObject column = columns.get(columnIndex);
+            String newMetricName = config.metricNamePrefix() + "." + column.getString("metric");
 
-          if (newMetric == null) {
-            newMetric = new JsonObject()
-              .putString("name", newMetricName)
-              .putArray("points", new JsonArray())
-              .putNumber("timestamp", metricTimestamp);
-            newMetricMap.put(newMetricName, newMetric);
+            JsonObject newMetric = newMetricMap.get(newMetricName);
+
+            if (newMetric == null) {
+              newMetric = new JsonObject()
+                .putString("name", newMetricName)
+                .putArray("points", new JsonArray())
+                .putNumber("timestamp", metricTimestamp);
+              newMetricMap.put(newMetricName, newMetric);
+            }
+
+            JsonArray newPoints = newMetric.getArray("points");
+            newPoints.addObject(new JsonObject()
+              .putNumber("time", pointTime)
+              .putString("serverName", serverName)
+              .putString("projectKey", projectKey)
+              .putString("projectName", projectName)
+              .putNumber("value", values.get(columnIndex)));
           }
-
-          JsonArray newPoints = newMetric.getArray("points");
-          newPoints.addObject(new JsonObject()
-            .putNumber("time", pointTime)
-            .putString("projectKey", projectKey)
-            .putString("projectName", projectName)
-            .putNumber("value", values.get(columnIndex)));
-        }
-      }
-    }
+        });
+      });
+    });
 
     JsonArray newMetrics = new JsonArray();
-
-    for (JsonObject newMetric : newMetricMap.values()) {
-      newMetrics.addObject(newMetric);
-    }
+    newMetricMap.values().forEach(newMetrics::addObject);
 
     handler.handle(newMetrics);
   }
@@ -200,7 +221,6 @@ public class SonarQubeCollectorVerticle extends Verticle {
 
   private void publishNewMetrics(JsonArray metrics, Handler<Void> handler) {
     logger.info("Publishing metrics to event bus");
-    logger.info("New metrics " + metrics);
     JsonObject message = new JsonObject()
       .putArray("metrics", metrics);
     eventBus.publish("io.squarely.vertxspike.metrics", message);

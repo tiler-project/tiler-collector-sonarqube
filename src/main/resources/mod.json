@@ -16,5 +16,6 @@
   ],
   "homepage": "https://github.com/tiler-project/tiler-collector-sonarqube",
 
-  "auto-redeploy": true
+  "auto-redeploy": true,
+  "includes": "io.tiler~tiler~0.1.7,org.simondean.vertx~vertx-async~0.1.1"
 }

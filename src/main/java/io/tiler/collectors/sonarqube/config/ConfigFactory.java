@@ -1,5 +1,6 @@
 package io.tiler.collectors.sonarqube.config;
 
+import io.tiler.time.TimePeriodParser;
 import org.vertx.java.core.json.JsonArray;
 import org.vertx.java.core.json.JsonObject;
 
@@ -7,7 +8,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class ConfigFactory {
-  private static final long ONE_HOUR_IN_MILLISECONDS = 60 * 60 * 1000l;
+  private final TimePeriodParser timePeriodParser = new TimePeriodParser();
 
   public Config load(JsonObject config) {
     return new Config(
@@ -17,7 +18,11 @@ public class ConfigFactory {
   }
 
   private long getCollectionIntervalInMilliseconds(JsonObject config) {
-    return config.getLong("collectionIntervalInMilliseconds", ONE_HOUR_IN_MILLISECONDS);
+    return timePeriodParser.parseTimePeriodToMilliseconds(config.getString("collectionIntervalInMilliseconds", "1h"));
+  }
+
+  private String getMetricNamePrefix(JsonObject config) {
+    return config.getString("metricNamePrefix", "sonarqube");
   }
 
   private List<Server> getServers(JsonObject config) {
@@ -44,7 +49,8 @@ public class ConfigFactory {
       getServerPort(server),
       getServerPath(server),
       getServerSsl(server),
-      getServerProjectLimit(server));
+      getServerProjectLimit(server),
+      getServerMetrics(server));
   }
 
   private String getServerName(JsonObject server) {
@@ -68,10 +74,40 @@ public class ConfigFactory {
   }
 
   private int getServerProjectLimit(JsonObject server) {
-    return server.getInteger("projectLimit", 10);
+    return server.getInteger("projectLimit", 0);
   }
 
-  private String getMetricNamePrefix(JsonObject config) {
-    return config.getString("metricNamePrefix", "sonarqube");
+  private List<Metric> getServerMetrics(JsonObject server) {
+    JsonArray metrics = server.getArray("metrics");
+    ArrayList<Metric> loadedMetrics = new ArrayList<>();
+
+    if (metrics == null) {
+      return loadedMetrics;
+    }
+
+    metrics.forEach(metricObject -> {
+      JsonObject metric = (JsonObject) metricObject;
+      loadedMetrics.add(getMetric(metric));
+    });
+
+    return loadedMetrics;
+  }
+
+  private Metric getMetric(JsonObject metric) {
+    return new Metric(
+      getMetricName(metric),
+      getMetricSonarQubeMetricKeys(metric));
+  }
+
+  private String getMetricName(JsonObject metric) {
+    return metric.getString("name");
+  }
+
+  private List<String> getMetricSonarQubeMetricKeys(JsonObject metric) {
+    ArrayList<String> items = new ArrayList<>();
+    metric.getArray("sonarQubeMetricKeys").forEach(item -> {
+      items.add((String) item);
+    });
+    return items;
   }
 }

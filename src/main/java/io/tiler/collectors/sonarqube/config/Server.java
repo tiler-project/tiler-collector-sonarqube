@@ -1,5 +1,7 @@
 package io.tiler.collectors.sonarqube.config;
 
+import java.util.List;
+
 public class Server {
   private final String name;
   private final String host;
@@ -7,8 +9,9 @@ public class Server {
   private final String path;
   private final boolean ssl;
   private final int projectLimit;
+  private final List<Metric> metrics;
 
-  public Server(String name, String host, Integer port, String path, boolean ssl, int projectLimit) {
+  public Server(String name, String host, Integer port, String path, boolean ssl, int projectLimit, List<Metric> metrics) {
     if (name == null) {
       name = host;
     }
@@ -26,6 +29,7 @@ public class Server {
     this.path = path;
     this.ssl = ssl;
     this.projectLimit = projectLimit;
+    this.metrics = metrics;
   }
 
   public String name() {
@@ -50,5 +54,9 @@ public class Server {
 
   public int projectLimit() {
     return projectLimit;
+  }
+
+  public List<Metric> metrics() {
+    return metrics;
   }
 }

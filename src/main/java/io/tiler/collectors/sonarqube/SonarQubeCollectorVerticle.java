@@ -1,5 +1,6 @@
 package io.tiler.collectors.sonarqube;
 
+import io.tiler.BaseCollectorVerticle;
 import io.tiler.collectors.sonarqube.config.Config;
 import io.tiler.collectors.sonarqube.config.ConfigFactory;
 import io.tiler.collectors.sonarqube.config.Server;
@@ -11,13 +12,11 @@ import org.vertx.java.core.http.HttpClient;
 import org.vertx.java.core.json.JsonArray;
 import org.vertx.java.core.json.JsonObject;
 import org.vertx.java.core.logging.Logger;
-import org.vertx.java.platform.Verticle;
 
-import java.util.HashMap;
-import java.util.List;
+import java.util.*;
 import java.util.stream.Collectors;
 
-public class SonarQubeCollectorVerticle extends Verticle {
+public class SonarQubeCollectorVerticle extends BaseCollectorVerticle {
   private Logger logger;
   private Config config;
   private EventBus eventBus;
@@ -37,7 +36,7 @@ public class SonarQubeCollectorVerticle extends Verticle {
       isRunning[0] = false;
     });
 
-    vertx.setPeriodic(3600000, aLong -> {
+    vertx.setPeriodic(config.collectionIntervalInMilliseconds(), aLong -> {
       if (isRunning[0]) {
         logger.info("Collection aborted as previous run still executing");
         return;
@@ -76,10 +75,9 @@ public class SonarQubeCollectorVerticle extends Verticle {
     getProjects(servers -> {
       getProjectMetrics(servers, aVoid -> {
         transformMetrics(servers, metrics -> {
-          publishNewMetrics(metrics, aVoid3 -> {
-            logger.info("Collection finished");
-            handler.handle(null);
-          });
+          saveMetrics(metrics);
+          logger.info("Collection finished");
+          handler.handle(null);
         });
       });
     });
@@ -103,8 +101,11 @@ public class SonarQubeCollectorVerticle extends Verticle {
         logger.info("Received " + projects.size() + " projects");
         int projectLimit = serverConfig.projectLimit();
         logger.info("Project limit set to " + projectLimit);
-        projects = new JsonArray(projects.toList().subList(0, Math.min(projects.size(), projectLimit)));
-        logger.info("There are " + projects.size() + " projects after limiting");
+
+        if (projectLimit > 0) {
+          projects = new JsonArray(projects.toList().subList(0, Math.min(projects.size(), projectLimit)));
+          logger.info("There are " + projects.size() + " projects after limiting");
+        }
 
         JsonObject server = new JsonObject()
           .putString("name", serverConfig.name())
@@ -139,7 +140,17 @@ public class SonarQubeCollectorVerticle extends Verticle {
     String projectKey = project.getString("k");
     logger.info("Getting metrics for " + projectKey + " project");
 
-    httpClients.get(serverIndex).getNow(serverConfig.path() + "/api/timemachine?resource=" + projectKey + "&metrics=coverage", response -> {
+    StringJoiner metricKeysBuilder = new StringJoiner(",");
+    HashSet<String> metricKeySet = new HashSet<>();
+
+    serverConfig.metrics().forEach(metricConfig -> {
+      metricKeySet.addAll(metricConfig.sonarQubeMetricKeys());
+    });
+
+    String metricKeys = String.join(",", metricKeySet);
+    String requestUri = serverConfig.path() + "/api/timemachine?resource=" + projectKey + "&metrics=" + metricKeys;
+
+    httpClients.get(serverIndex).getNow(requestUri, response -> {
       response.bodyHandler(body -> {
         logger.info("Received metrics for " + projectKey + " project");
         JsonArray timeMachine = new JsonArray(body.toString());
@@ -159,11 +170,42 @@ public class SonarQubeCollectorVerticle extends Verticle {
   private void transformMetrics(JsonArray servers, Handler<JsonArray> handler) {
     logger.info("Transforming metrics");
     HashMap<String, JsonObject> newMetricMap = new HashMap<>();
-    long metricTimestamp = getCurrentTimestampInMicroseconds();
+    long metricTimestamp = currentTimeInMicroseconds();
 
-    servers.forEach(serverObject -> {
-      JsonObject server = (JsonObject) serverObject;
+    for (int serverIndex = 0, serverCount = config.servers().size(); serverIndex < serverCount; serverIndex++) {
+      Server serverConfig = config.servers().get(serverIndex);
+      JsonObject server = servers.get(serverIndex);
       String serverName = server.getString("name");
+
+      HashMap<String, ArrayList<JsonObject>> metricKeyToMetricsMap = new HashMap<>();
+
+      serverConfig.metrics().forEach(metricConfig -> {
+        String metricName = config.getFullMetricName(metricConfig);
+
+        JsonObject metric = newMetricMap.get(metricName);
+
+        if (metric == null) {
+          metric = new JsonObject()
+            .putString("name", metricName)
+            .putArray("points", new JsonArray())
+            .putNumber("timestamp", metricTimestamp);
+          newMetricMap.put(metricName, metric);
+        }
+
+        List<String> metricKeys = metricConfig.sonarQubeMetricKeys();
+
+        for (int metricKeyIndex = 0, metricKeyCount = metricKeys.size(); metricKeyIndex < metricKeyCount; metricKeyIndex++) {
+          String metricKey = metricKeys.get(metricKeyIndex);
+          ArrayList<JsonObject> newMetrics = metricKeyToMetricsMap.get(metricKey);
+
+          if (newMetrics == null) {
+            newMetrics = new ArrayList<>();
+            metricKeyToMetricsMap.put(metricKey, newMetrics);
+          }
+
+          newMetrics.add(metric);
+        }
+      });
 
       server.getArray("projects").forEach(projectObject -> {
         JsonObject project = (JsonObject) projectObject;
@@ -180,30 +222,28 @@ public class SonarQubeCollectorVerticle extends Verticle {
           JsonArray values = cell.getArray("v");
 
           for (int columnIndex = 0, columnCount = columns.size(); columnIndex < columnCount; columnIndex++) {
-            JsonObject column = columns.get(columnIndex);
-            String newMetricName = config.metricNamePrefix() + "." + column.getString("metric");
+            Number value = values.get(columnIndex);
 
-            JsonObject newMetric = newMetricMap.get(newMetricName);
+            if (value != null) {
+              JsonObject column = columns.get(columnIndex);
+              String metricKey = column.getString("metric");
 
-            if (newMetric == null) {
-              newMetric = new JsonObject()
-                .putString("name", newMetricName)
-                .putArray("points", new JsonArray())
-                .putNumber("timestamp", metricTimestamp);
-              newMetricMap.put(newMetricName, newMetric);
+              ArrayList<JsonObject> newMetrics = metricKeyToMetricsMap.get(metricKey);
+
+              for (int metricIndex = 0, metricCount = newMetrics.size(); metricIndex < metricCount; metricIndex++) {
+                JsonArray newPoints = newMetrics.get(metricIndex).getArray("points");
+                newPoints.addObject(new JsonObject()
+                  .putNumber("time", pointTime)
+                  .putString("serverName", serverName)
+                  .putString("projectKey", projectKey)
+                  .putString("projectName", projectName)
+                  .putNumber("value", value));
+              }
             }
-
-            JsonArray newPoints = newMetric.getArray("points");
-            newPoints.addObject(new JsonObject()
-              .putNumber("time", pointTime)
-              .putString("serverName", serverName)
-              .putString("projectKey", projectKey)
-              .putString("projectName", projectName)
-              .putNumber("value", values.get(columnIndex)));
           }
         });
       });
-    });
+    }
 
     JsonArray newMetrics = new JsonArray();
     newMetricMap.values().forEach(newMetrics::addObject);
@@ -213,17 +253,5 @@ public class SonarQubeCollectorVerticle extends Verticle {
 
   private long getTimestampInMicrosecondsFromISODateTime(String isoDateTime) {
     return dateTimeFormatter.parseDateTime(isoDateTime).getMillis() * 1000;
-  }
-
-  private long getCurrentTimestampInMicroseconds() {
-    return System.currentTimeMillis() * 1000;
-  }
-
-  private void publishNewMetrics(JsonArray metrics, Handler<Void> handler) {
-    logger.info("Publishing metrics to event bus");
-    JsonObject message = new JsonObject()
-      .putArray("metrics", metrics);
-    eventBus.publish("io.squarely.vertxspike.metrics", message);
-    handler.handle(null);
   }
 }

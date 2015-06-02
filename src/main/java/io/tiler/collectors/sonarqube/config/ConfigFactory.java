@@ -1,6 +1,6 @@
 package io.tiler.collectors.sonarqube.config;
 
-import io.tiler.time.TimePeriodParser;
+import io.tiler.core.time.TimePeriodParser;
 import org.vertx.java.core.json.JsonArray;
 import org.vertx.java.core.json.JsonObject;
 
